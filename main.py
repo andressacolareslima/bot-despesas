@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+import asyncio
+import logging
 import httpx
 import re
 import os
@@ -10,10 +12,13 @@ import os
 from models import SessionLocal, Expense, ProcessedMessage
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://evolution-api:8080")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
-INSTANCE_NAME = "despesas"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_GROUP_NAME = os.getenv("TELEGRAM_GROUP_NAME", "Fluxo de Caixa - Marta")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MAX_AMOUNT = 99999999.99
 LOCAL_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
@@ -23,6 +28,11 @@ PATTERN_DATE_VALUE = re.compile(
 )
 PATTERN_CURRENCY_VALUE = re.compile(
     r"R\$\s*([-+]?\s*\d+(?:[.,]\d{1,2})?)", re.IGNORECASE
+)
+PATTERN_NATURAL_VALUE = re.compile(
+    r"\b(?:deu|total(?:izou)?|gastei|custou|ficou|saiu|valor(?:\s+foi)?)"
+    r"\s*:?\s*(?:R\$\s*)?([-+]?\s*\d+(?:[.,]\d{1,2})?)",
+    re.IGNORECASE,
 )
 PATTERN_ANY_DATE = re.compile(
     r"(?<!\d)(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?!\d)"
@@ -48,36 +58,48 @@ def parse_date(date_str: str) -> date:
         year += 2000
     return date(year, month, day)
 
-async def send_whatsapp_reply(remote_jid: str, text: str):
-    url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
-    headers = {"apikey": EVOLUTION_API_KEY}
-    payload = {"number": remote_jid, "text": text}
+async def send_telegram_reply(chat_id: int, text: str):
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
     async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload, headers=headers)
+        response = await client.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("description", "Telegram API error"))
 
-@app.post("/webhook")
-async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
-    data = payload.get("data", {})
-    key = data.get("key", {})
-
-    remote_jid = key.get("remoteJid")
-    message_id = key.get("id")
+async def handle_telegram_message(
+    chat_id: int, message_id: str, sender: str, text: str, db: Session
+):
     if message_id and db.query(ProcessedMessage).filter(
         ProcessedMessage.message_id == message_id
     ).first():
         return {"status": "duplicate_ignored"}
 
-    sender = data.get("pushName") or "Alguém"
-    text = (
-        data.get("message", {}).get("conversation")
-        or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
-    ).strip()
+    text = text.strip()
+
+    if text.lower() in {"/ajuda", "/help"}:
+        reply = (
+            "📚 *Comandos do bot:*\n"
+            "• `/total` - total do mês atual\n"
+            "• `/mês` - resumo detalhado do mês atual\n"
+            "• `/entradas` - lista todos os registros\n"
+            "• `/consultar DD/MM/AAAA` - consulta um dia específico\n"
+            "• `/pago` - apaga todos os registros\n\n"
+            "💰 *Registrar despesa:*\n"
+            "• `25,90`\n"
+            "• `25,90 15/03/2026`\n"
+            "• `15/03/2026 25,90`\n"
+            "• Também aceito mensagens como `Almoço R$ 25,90`."
+        )
+        await send_telegram_reply(chat_id, reply)
+        return {"status": "help_sent"}
 
     if text.lower() == "/pago":
         db.query(Expense).delete(synchronize_session=False)
         db.query(ProcessedMessage).delete(synchronize_session=False)
         db.commit()
-        await send_whatsapp_reply(remote_jid, "✅ Registros apagados. Banco zerado.")
+        await send_telegram_reply(chat_id, "✅ Registros apagados. Banco zerado.")
         return {"status": "cleared"}
 
     consult_match = PATTERN_CONSULT_DATE.match(text)
@@ -85,7 +107,7 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
         try:
             consult_date = parse_date(consult_match.group(1))
         except ValueError:
-            await send_whatsapp_reply(remote_jid, "❌ Data inválida. Use DD/MM/AAAA.")
+            await send_telegram_reply(chat_id, "❌ Data inválida. Use DD/MM/AAAA.")
             return {"status": "invalid_date"}
 
         entries = db.query(Expense).filter(
@@ -103,7 +125,7 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             )
         else:
             reply = f"📅 Nenhum registro em {consult_date.strftime('%d/%m/%Y')}."
-        await send_whatsapp_reply(remote_jid, reply)
+        await send_telegram_reply(chat_id, reply)
         return {"status": "consulted"}
 
     if text.lower() == "/entradas":
@@ -119,7 +141,7 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             reply = f"📋 *Entradas registradas:*\n{details}\n\n📊 *Total:* R$ {total:.2f}"
         else:
             reply = "📋 Nenhuma entrada registrada."
-        await send_whatsapp_reply(remote_jid, reply)
+        await send_telegram_reply(chat_id, reply)
         return {"status": "entries_sent", "count": len(entries)}
 
     if text.lower() in {"/total", "!total", "/mês", "/mes"}:
@@ -140,13 +162,17 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             )
         else:
             reply = f"📊 *Total acumulado em {today.strftime('%m/%Y')}:* R$ {month_total:.2f}"
-        await send_whatsapp_reply(remote_jid, reply)
+        await send_telegram_reply(chat_id, reply)
         return {"status": "summary_sent"}
 
     listed_expenses = []
     for line in text.splitlines():
         currency_matches = list(PATTERN_CURRENCY_VALUE.finditer(line))
-        if not currency_matches:
+        natural_matches = [] if currency_matches else list(
+            PATTERN_NATURAL_VALUE.finditer(line)
+        )
+        value_matches = currency_matches or natural_matches
+        if not value_matches:
             continue
 
         line_date = datetime.now(LOCAL_TIMEZONE).date()
@@ -157,9 +183,9 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             except ValueError:
                 continue
 
-        for currency_match in currency_matches:
+        for value_match in value_matches:
             line_amount = float(
-                currency_match.group(1).replace(",", ".").replace(" ", "")
+                value_match.group(1).replace(",", ".").replace(" ", "")
             )
             if abs(line_amount) > MAX_AMOUNT:
                 return {"status": "invalid_amount"}
@@ -187,7 +213,7 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             f"✅ *{len(listed_expenses)} valores registrados*\n"
             f"📊 *Soma da mensagem:* R$ {message_total:.2f}"
         )
-        await send_whatsapp_reply(remote_jid, reply)
+        await send_telegram_reply(chat_id, reply)
         return {"status": "recorded", "count": len(listed_expenses)}
 
     target_date = None
@@ -234,7 +260,71 @@ async def handle_whatsapp_webhook(payload: dict, db: Session = Depends(get_db)):
             f"✅ *R$ {amount:.2f}* registrado ({formatted_date}) por {sender}\n"
             f"📊 *Total do mês ({target_date.strftime('%m/%Y')}):* R$ {month_total:.2f}"
         )
-        await send_whatsapp_reply(remote_jid, reply)
+        await send_telegram_reply(chat_id, reply)
         return {"status": "recorded"}
 
     return {"status": "no_action"}
+
+
+async def telegram_polling():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    offset = 0
+    async with httpx.AsyncClient(timeout=35) as client:
+        while True:
+            try:
+                response = await client.get(
+                    f"{TELEGRAM_API_URL}/getUpdates",
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["message"]'},
+                )
+                response.raise_for_status()
+                updates = response.json().get("result", [])
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    chat = message.get("chat", {})
+                    chat_id = chat.get("id")
+                    chat_title = chat.get("title", "")
+                    configured_chat = str(chat_id) == TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else False
+                    if chat.get("type") not in {"group", "supergroup"}:
+                        continue
+                    normalized_title = " ".join(chat_title.casefold().split())
+                    configured_title = " ".join(TELEGRAM_GROUP_NAME.casefold().split())
+                    if normalized_title != configured_title and not configured_chat:
+                        continue
+                    text = message.get("text", "")
+                    if not text:
+                        continue
+                    sender_data = message.get("from", {})
+                    sender = (
+                        sender_data.get("first_name", "Alguém")
+                        + (f" {sender_data['last_name']}" if sender_data.get("last_name") else "")
+                    )
+                    db = SessionLocal()
+                    try:
+                        await handle_telegram_message(
+                            chat_id,
+                            str(update["update_id"]),
+                            sender,
+                            text,
+                            db,
+                        )
+                    finally:
+                        db.close()
+            except Exception:
+                logger.exception("Erro no polling do Telegram")
+                await asyncio.sleep(5)
+
+
+@app.on_event("startup")
+async def start_telegram_polling():
+    if TELEGRAM_BOT_TOKEN:
+        app.state.telegram_task = asyncio.create_task(telegram_polling())
+
+
+@app.on_event("shutdown")
+async def stop_telegram_polling():
+    task = getattr(app.state, "telegram_task", None)
+    if task:
+        task.cancel()
