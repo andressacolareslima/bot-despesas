@@ -1,0 +1,11 @@
+name = "bot-despesas"
+main = "src/index.js"
+compatibility_date = "2026-09-10"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bot-despesas-db"
+database_id = "310ae149-d641-4c36-b011-ec2d509a650c"
+
+[vars]
+TELEGRAM_GROUP_NAME = "Fluxo de Caixa - Marta"

@@ -1,7 +1,26 @@
+# Local environment and Worker development secrets
 .env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+secrets*.json
+
+# Local dependencies and generated files
 .venv/
 __pycache__/
 *.py[cod]
 *.log
 pgdata/
+node_modules/
+.wrangler/
 
