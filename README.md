@@ -60,8 +60,6 @@ cloudflare-worker/
 - Node.js instalado
 - Bot adicionado ao grupo do Telegram
 
-Não é necessário Python, Docker, MongoDB, VPS ou Cloudflare Tunnel.
-
 ## Configuração inicial
 
 Abra o PowerShell na raiz do projeto:
@@ -129,6 +127,9 @@ Dentro de `cloudflare-worker`, execute:
 npx wrangler deploy
 ```
 
+---
+
+Bot de despesas para uso diário no Telegram.
 O endereço atual é:
 
 ```text
@@ -221,6 +222,4 @@ Publicar uma nova versão após alterar o código:
 npx wrangler deploy
 ```
 
-## Dados antigos
 
-O banco D1 é independente do MongoDB antigo. Registros que estavam no MongoDB não são migrados automaticamente. O Worker atual usa exclusivamente o D1.
